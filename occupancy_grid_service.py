@@ -345,7 +345,7 @@ def add_occupancy_grid_arguments(parser):
     parser.add_argument('--anchor-x', type=float, help="x-coordinate of anchor tag in the grid (meters)", required=False, default=0)
     parser.add_argument('--anchor-y', type=float, help="y-coordinate of anchor tag in the grid (meters)", required=False, default=0)
     parser.add_argument('--anchor-angle', type=float, help="orientation of anchor tag in the grid (degrees)", required=False, default=0)
-    parser.add_argument('--data-floor', type=float help="clip point cloud below this height (meters)", required=False, default=0.2)
+    parser.add_argument('--data-floor', type=float, help="clip point cloud below this height (meters)", required=False, default=0.2)
     parser.add_argument('--data-ceiling', type=float, help="clip point cloud above this height (meters)", required=False, default=1.4)
 
 
