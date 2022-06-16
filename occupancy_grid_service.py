@@ -1,14 +1,11 @@
 
 import argparse
-import collections
-from email.policy import default
 import logging
-import sys
-from this import d
 import time
 import threading
 from typing import List
 import numpy as np
+import numpy.ma as ma
 import cv2 as cv
 
 import bosdyn
@@ -34,35 +31,34 @@ from bosdyn.client.math_helpers import *
 from bosdyn.api import geometry_pb2 as geom
 from bosdyn.api import world_object_pb2
 
-# from skimage.draw import line
+from skimage.draw import line
 
 
 DIRECTORY_NAME = 'pcl-occupancy-grid'
-AUTHORITY = 'occupancy-grid'
+AUTHORITY = 'pcl-occupancy-grid'
 SERVICE_TYPE = 'bosdyn.api.LocalGridService'
 
 
 LOGGER = logging.getLogger(__name__)
 
 
-def get_point_cloud_data_in_grid_frame(pcl):
+def get_pcl_in_frame(cloud, inertial, offset):
     """
     Create a 3 x N numpy array of points in the grid frame. 
     :return: a 3 x N numpy array in the seed frame.
     """
-    
-    cloud = pcl
     #TODO: vision, odom, or ground plane?
-    vision_tform_cloud = get_a_tform_b(cloud.source.transforms_snapshot, VISION_FRAME_NAME,
+    inertial_tform_cloud = get_a_tform_b(cloud.source.transforms_snapshot, inertial,
                                      cloud.source.frame_name_sensor)
+    grid_tform_inertial = SE3Pose.from_se2(offset)
+    grid_tform_cloud = grid_tform_inertial*inertial_tform_cloud
     point_cloud_data = np.frombuffer(cloud.data, dtype=np.float32).reshape(int(cloud.num_points), 3)
-    return vision_tform_cloud.transform_cloud(point_cloud_data)
+    return grid_tform_cloud.transform_cloud(point_cloud_data)
 
 
 
-
-def _update_thread(async_task):
-    while True:
+def _update_thread(async_task, stop_signal):
+    while not stop_signal.is_set():
         async_task.update()
         time.sleep(0.01)
 
@@ -77,13 +73,13 @@ class AsyncPointCloud(AsyncPeriodicQuery):
         return self._client.get_point_cloud_from_sources_async(self._sources)
 
 
-class AsyncFiducialObjects(AsyncPeriodicQuery):
-    def __init__(self, query_name, client, period_sec):
-        super().__init__(query_name, client, LOGGER, period_sec)
+class AsyncRobotState(AsyncPeriodicQuery):
+    def __init__(self, robot_state_client):
+        super().__init__("robot_state", robot_state_client, LOGGER,
+                                              period_sec=0.1)
 
     def _start_query(self):
-        return self._client.list_world_objects_async(object_type=[world_object_pb2.WORLD_OBJECT_APRILTAG])
-
+        return self._client.get_robot_state_async()
 
 
 
@@ -120,34 +116,75 @@ class OccupancyGrid:
     OCCUPIED=0
     UNKNOWN=0x80
     FREE=0xff
-    def __init__(self, grid_width, grid_height, grid_scale, 
-                    grid_anchor_x, grid_anchor_y, grid_anchor_angle, 
-                    data_floor, data_ceiling, dtype=np.uint8,
+    def __init__(self, grid_width, grid_height, grid_scale, occupancy_threshold,
+                    data_frame, data_frame_centered=False,
+                    data_frame_offset_x=0.0, data_frame_offset_y=0.0, data_frame_offset_theta=0.0,
+                    data_floor=0.2, data_ceiling=2, dtype=np.uint8,
                     logger=None) -> None:
         #compute static grid transform to tag
         self.grid_width = grid_width
         self.grid_height = grid_width
         self.grid_scale = grid_scale
+        self.occupancy_threshold = occupancy_threshold
+
+        self.data_frame = data_frame
+
+        grid_x, grid_y = grid_width*grid_scale, grid_height*grid_scale
+
+        if data_frame_centered:
+            self.data_frame_tform_grid = SE2Pose(grid_x/2.0, grid_y/2.0, 0)
+        else:
+            self.data_frame_tform_grid = SE2Pose(data_frame_offset_x*grid_scale, data_frame_offset_y*grid_scale, data_frame_offset_theta)
 
         self.data_floor = data_floor
         self.data_ceiling = data_ceiling
         
-        #observation grid (unknown, ray traced free, occupied))
-        self._data = np.full((grid_width, grid_height), self.UNKNOWN, dtype=dtype)
-
-        #occupancy belief(floating point)
+        #a belief with a mask        
+        self._occupancy = ma.masked_all((grid_width, grid_height), dtype=np.float32)
 
 
-    def add_pcl(self, anchor, pcl):
-        # transform to grid frame via anchor tag frame
-        start = self._real_to_grid(anchor.x, anchor.y)
-        for point in pcl:
+    @property
+    def occupied(self):
+        return np.where(np.logical_and(self._occupancy.data > self.occupancy_threshold, np.logical_not(self._occupancy.mask)), 255, 0).astype(dtype=np.uint8)
+
+    @property
+    def free(self):
+        return np.where(np.logical_and(self._occupancy.data < self.occupancy_threshold, np.logical_not(self._occupancy.mask)), 255, 0).astype(dtype=np.uint8)
+    
+    @property
+    def unknown(self):
+        return np.where(self._occupancy.mask, 255, 0).astype(dtype=np.uint8)
+
+    @property
+    def composite(self):
+        pass
+
+    def add_pcl(self, pcl):
+        inertial_tform_cloud = get_a_tform_b(pcl.source.transforms_snapshot, self.data_frame,
+                                     pcl.source.frame_name_sensor)
+        grid_tform_inertial = SE3Pose.from_se2(self.data_frame_tform_grid)
+        grid_tform_cloud = grid_tform_inertial*inertial_tform_cloud
+        point_cloud_data = np.frombuffer(pcl.data, dtype=np.float32).reshape(int(pcl.num_points), 3)
+        point_cloud_data = grid_tform_cloud.transform_cloud(point_cloud_data)
+        
+        start = self._real_to_grid(grid_tform_cloud.x, grid_tform_cloud.y)
+        for point in point_cloud_data:
             if point.z < self.data_floor or point.z > self.data_ceiling:
                 continue
             end = self._real_to_grid(point.x, point.y)
-            cv.line(self._data, start, end, self.FREE)
+
+            free_trace = line(start[0],start[1],end[0],end[1])
+            for pt in zip(free_trace):
+                try:
+                    if self._occupancy.mask[pt.x,pt.y]:
+                        self._occupancy[pt.x,pt.y] = 0.0
+                    else:
+                        self._occupancy[pt.x,pt.y] *= 0.9
+                except:
+                    pass
+
             try:
-                self._data[end[0],end[1]] = self.OCCUPIED
+                self._occupancy[end[0],end[1]] = 1
             except IndexError:
                 pass
             
@@ -172,31 +209,26 @@ class OccupancyGrid:
         #assumes x,y are already in the local coordinate frame
         return round(x/self.grid_scale), round(y/self.grid_scale)
 
-    def shift(self, x_offset, y_offset):
-        np.roll(self._data, (x_offset, y_offset), axis=(0,1)) 
+    # def shift(self, x_offset, y_offset):
+    #     np.roll(self._data, (x_offset, y_offset), axis=(0,1)) 
 
-    def regrid(self, x_offset, y_offset, theta):
-        pass
+    # def regrid(self, x_offset, y_offset, theta):
+    #     pass
 
-    def clear(self):
-        pass
+    # def clear(self):
+    #     pass
 
 
 class OccupancyGridUpdater:
-    def __init__(self, robot, grid, pcl_sources_by_service, logger=None) -> None:
+    def __init__(self, robot, grid, pcl_source_name, logger=None) -> None:
         self._grid = grid
-        self._point_cloud_client = {}
-        self._point_cloud_task = {}
-        for service_name in pcl_sources_by_service.keys():
-            self._point_cloud_client[service_name] = robot.ensure_client(service_name)
-            self._point_cloud_task[service_name] = AsyncPointCloud(self._point_cloud_client, pcl_sources_by_service[service_name])
+        fields = pcl_source_name.split(':')
+        pcl_service_name = fields[0]
+        pcl_source_name = fields[1]
 
-        _async_tasks = AsyncTasks(list(self._point_cloud_task.values()))
+        
 
-        self._stop_signal = threading.Event()
-        self._async_updates_thread = threading.Thread(target=_update_thread, args=[_async_tasks, self._stop_signal])
-        self._async_updates_thread.daemon = True
-        self._async_updates_thread.start()
+       
 
         self._grid_update_thread = threading.Thread(target=self.update_runner)
 
@@ -240,10 +272,9 @@ class OccupancyGridServicer(local_grid_service_pb2_grpc.LocalGridServiceServicer
     _all_grid_types = ['occupied-odom', 'occupied-visual', 'occupied-graphnav', 'occupied-body',
                        'free-space-odom', 'free-space-visual', 'free-space-graphnav', 'free-space-body',
                        'unknown-odom', 'unknown-visual', 'unknown-graphnav', 'unknown-body',
-                       'UFO-odom', 'UFO-visual', 'UFO-graphnav', 'UFO-body',
-                       'warehouse-odom', 'warehouse-visual', 'warehouse-graphnav', 'warehouse-body']
+                       'UFO-odom', 'UFO-visual', 'UFO-graphnav', 'UFO-body']
 
-    def __init__(self, bosdyn_sdk_robot, service_name, pcl_source_name, 
+    def __init__(self, bosdyn_sdk_robot, service_name, pcl_source_id, 
                     grid_width, grid_height, grid_scale, 
                     
                     anchor_april_tag, 
@@ -257,17 +288,36 @@ class OccupancyGridServicer(local_grid_service_pb2_grpc.LocalGridServiceServicer
         else:
             self.logger = logger
 
-        self.bosdyn_sdk_robot = bosdyn_sdk_robot
-
-        # Service name this servicer is associated with in the robot directory.
-        self.service_name = service_name
-
-        # Fault client to report service faults
-        self.fault_client = self.bosdyn_sdk_robot.ensure_client(FaultClient.default_service_name)
-
+        self.robot = bosdyn_sdk_robot
+        fields = pcl_source_id.split(':')
+        pcl_service = fields[0]
+        pcl_source = fields[1]
+        
         # Get a timesync endpoint from the robot instance such that the image timestamps can be
         # reported in the robot's time.
-        self.bosdyn_sdk_robot.time_sync.wait_for_sync()
+        self.robot.time_sync.wait_for_sync()
+        
+        # Service name this servicer is associated with in the robot directory.
+
+        # Fault client to report service faults
+        self.fault_client = self.robot.ensure_client(FaultClient.default_service_name)
+
+        self._robot_state_client = self.robot.ensure_client(RobotStateClient.default_service_name)
+        self._point_cloud_client = self.robot.ensure_client(pcl_service)
+        
+        self._point_cloud_task = AsyncPointCloud(self._point_cloud_client, [pcl_source])
+        self._robot_state_task = AsyncRobotState(self._robot_state_client)
+
+        _async_tasks = AsyncTasks([self._robot_state_task, self._point_cloud_task])
+
+        self._stop_signal = threading.Event()
+        self._async_updates_thread = threading.Thread(target=_update_thread, args=[_async_tasks, self._stop_signal])
+        self._async_updates_thread.daemon = True
+        self._async_updates_thread.start()
+
+
+
+
 
         self._grid = OccupancyGrid(grid_width, grid_height, grid_scale, grid_anchor_x, grid_anchor_y, grid_anchor_angle)
         self._grid_updater = OccupancyGridUpdater(bosdyn_sdk_robot, self._grid, pcl_source_name)
